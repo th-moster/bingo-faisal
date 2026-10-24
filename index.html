@@ -27,7 +27,10 @@
 *,*::before,*::after{box-sizing:border-box}
 html,body{margin:0}
 body{background:var(--bg);color:var(--ink);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;line-height:1.45}
-main{max-width:1100px;margin:0 auto;padding:20px 16px 40px;display:grid;gap:20px;grid-template-columns:minmax(0,320px) minmax(0,1fr);align-items:start}
+main{max-width:680px;margin:0 auto;padding:20px 16px 40px;display:grid;gap:16px}
+details.panel>summary{cursor:pointer;font-weight:700;font-size:1.05rem}
+details.panel[open]>summary{margin-bottom:12px}
+input[type=text]{background:var(--cell);color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:7px 8px;font:inherit;width:9ch}
 main.solo{grid-template-columns:minmax(0,640px);justify-content:center}
 .note{font-size:.85rem;color:var(--muted);margin:0 0 8px}
 .note.bad{color:var(--win);font-weight:600}
@@ -62,11 +65,11 @@ button:focus-visible,textarea:focus-visible,select:focus-visible,.cell:focus-vis
 </style>
 </head>
 <body>
-<main id="main">
-  <section class="panel" id="editor" hidden>
-    <h1>Bingo</h1>
-    <p class="sub">Eintrag pro Zeile. Das Board wird zufällig gefüllt und für alle Beteiligten live geteilt.</p>
-    <label for="pool">Feld-Pool</label>
+<main>
+  <h1 style="margin:0">Bingo</h1>
+  <details class="panel" id="admin" open>
+    <summary>Board verwalten</summary>
+    <label for="pool">Feld-Pool (ein Eintrag pro Zeile)</label>
     <textarea id="pool" spellcheck="false"></textarea>
     <div class="count" id="count"></div>
     <div class="row">
@@ -82,9 +85,13 @@ button:focus-visible,textarea:focus-visible,select:focus-visible,.cell:focus-vis
       <button class="primary" id="gen">Neues Board für alle</button>
       <button id="reset">Markierungen löschen</button>
     </div>
-  </section>
+    <div class="row">
+      <label for="room" style="margin:0">Raum</label>
+      <input type="text" id="room" maxlength="24" autocomplete="off">
+      <button id="copy">Link kopieren</button>
+    </div>
+  </details>
   <section>
-    <h1 id="title" hidden>Bingo</h1>
     <p class="note" id="note"></p>
     <p class="status" id="status" aria-live="polite"></p>
     <div id="boardWrap"></div>
@@ -92,6 +99,11 @@ button:focus-visible,textarea:focus-visible,select:focus-visible,.cell:focus-vis
 </main>
 <script>
 (function(){
+  // Firebase Realtime Database URL hier eintragen, z. B.
+  // "https://mein-projekt-default-rtdb.europe-west1.firebasedatabase.app"
+  // Leer lassen = lokaler Modus ohne Teilen.
+  var FIREBASE_URL = "";
+
   var DEFAULT_POOL = [
     "Jemand kommt zu spät","Beamer startet nicht","„Das ist trivial“","Handy klingelt","Mikrofon rauscht",
     "Folie wird übersprungen","Kaffee in der Hand","Frage bleibt unbeantwortet","Tippfehler auf der Folie","Pause wird verlängert",
@@ -102,10 +114,17 @@ button:focus-visible,textarea:focus-visible,select:focus-visible,.cell:focus-vis
 
   var $ = function(id){ return document.getElementById(id); };
   var poolEl=$("pool"), sizeEl=$("size"), freeEl=$("free"), countEl=$("count"),
-      wrap=$("boardWrap"), statusEl=$("status"), noteEl=$("note");
-  var board=null, marks={}, canEdit=true, canMark=true, store=null, mode="local", dirty=false, errMsg="", busy={};
+      wrap=$("boardWrap"), statusEl=$("status"), noteEl=$("note"), roomEl=$("room");
+  var live = !!FIREBASE_URL, state={}, room="", dirty=false, errMsg="", connected=false, es=null;
 
   poolEl.value = DEFAULT_POOL;
+
+  function readRoom(){
+    room=(location.hash||"").replace(/^#/,"").replace(/[^A-Za-z0-9_-]/g,"");
+    if(!room){ room=Math.random().toString(36).slice(2,7); history.replaceState(null,"","#"+room); }
+    roomEl.value=room;
+  }
+  function base(){ return FIREBASE_URL.replace(/\/$/,"")+"/bingo/"+room; }
 
   function items(){
     var seen={}, out=[];
@@ -130,13 +149,38 @@ button:focus-visible,textarea:focus-visible,select:focus-visible,.cell:focus-vis
   }
   function esc(s){ return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
 
-  function fail(e){
-    if(e && e.code==="invalid_argument"){ canMark=false; errMsg="Du hast nur Leserechte. Bitte bitte um Bearbeitungsrechte."; }
-    else if(e && e.code==="quota_exceeded"){ errMsg="Speicherlimit erreicht."; }
-    else { errMsg="Änderung konnte nicht gespeichert werden."; }
-    render();
+  // Zustand spiegeln (Firebase-Streaming-Format: Pfad + Daten, null = löschen)
+  function apply(path,data){
+    var p=path.split("/").filter(Boolean);
+    if(!p.length){ state=data||{}; return; }
+    var o=state, i;
+    for(i=0;i<p.length-1;i++){ if(typeof o[p[i]]!=="object"||o[p[i]]===null) o[p[i]]={}; o=o[p[i]]; }
+    if(data===null) delete o[p[p.length-1]]; else o[p[p.length-1]]=data;
   }
-  function safe(p){ return Promise.resolve(p).then(function(){ if(errMsg){ errMsg=""; render(); } }, fail); }
+  function write(path,data){
+    apply(path,data); render();
+    if(!live) return;
+    fetch(base()+path+".json",{method:data===null?"DELETE":"PUT",body:data===null?undefined:JSON.stringify(data)})
+      .then(function(r){ if(!r.ok) throw new Error(r.status); if(errMsg){ errMsg=""; render(); } })
+      .catch(function(){ errMsg="Änderung konnte nicht gespeichert werden (Verbindung oder Datenbank-Regeln prüfen)."; render(); });
+  }
+
+  function connect(){
+    if(es){ es.close(); es=null; }
+    state={}; connected=false; render();
+    if(!live) return;
+    es=new EventSource(base()+".json");
+    es.onopen=function(){ connected=true; render(); };
+    es.onerror=function(){ connected=false; render(); };
+    es.addEventListener("put",function(e){
+      var d=JSON.parse(e.data); apply(d.path,d.data); syncEditor(); render();
+    });
+    es.addEventListener("patch",function(e){
+      var d=JSON.parse(e.data), pre=d.path.replace(/\/$/,"");
+      Object.keys(d.data||{}).forEach(function(k){ apply(pre+"/"+k,d.data[k]); });
+      syncEditor(); render();
+    });
+  }
 
   function generate(){
     var list=items(), need=needed(), n=parseInt(sizeEl.value,10), useFree=freeEl.checked && n%2===1;
@@ -147,16 +191,11 @@ button:focus-visible,textarea:focus-visible,select:focus-visible,.cell:focus-vis
     errMsg="";
     var picked=shuffle(list.slice()).slice(0,need), cells=[], k=0, mid=(n*n-1)/2;
     for(var i=0;i<n*n;i++) cells.push(useFree && i===mid ? "" : picked[k++]);
-    var now=Date.now();
     dirty=false;
-    safe(store.setBoard({size:n,free:useFree,freeIdx:useFree?mid:-1,pool:poolEl.value,cells:cells,rev:now,markRev:now}));
+    write("",{size:n,free:useFree,freeIdx:useFree?mid:-1,pool:poolEl.value,cells:cells});
   }
 
-  function isOn(i){
-    if(board.freeIdx===i) return true;
-    var m=marks["c"+i];
-    return !!(m && m.on && m.rev===board.markRev);
-  }
+  function isOn(i){ return state.freeIdx===i || !!(state.marks && state.marks["c"+i]===true); }
   function lines(n){
     var L=[], i, j, r, c;
     for(i=0;i<n;i++){ r=[]; c=[]; for(j=0;j<n;j++){ r.push(i*n+j); c.push(j*n+i); } L.push(r,c); }
@@ -165,17 +204,16 @@ button:focus-visible,textarea:focus-visible,select:focus-visible,.cell:focus-vis
   }
 
   function render(){
-    $("editor").hidden = !canEdit;
-    $("title").hidden = canEdit;
-    $("main").className = canEdit ? "" : "solo";
-    var base = mode==="live" ? "Live: Markierungen sind für alle sofort sichtbar." : "Nur lokal: Dieses Board ist nicht geteilt.";
-    noteEl.textContent = errMsg || base; noteEl.className = "note"+(errMsg?" bad":"");
-    if(!board){
+    var base_note = !live ? "Lokaler Modus: Zum Teilen die Firebase-URL in der Datei eintragen."
+      : connected ? "Live im Raum „"+room+"“: Änderungen sind für alle sofort sichtbar."
+      : "Verbinde …";
+    noteEl.textContent = errMsg || base_note; noteEl.className = "note"+(errMsg?" bad":"");
+    if(!state.cells || !state.size){
       statusEl.textContent="";
-      wrap.innerHTML='<div class="empty">'+(canEdit?'Noch kein Board. Erstelle links eines mit „Neues Board für alle“.':'Noch kein Board. Die Spielleitung hat noch keines erstellt, diese Seite aktualisiert sich automatisch.')+'</div>';
+      wrap.innerHTML='<div class="empty">Noch kein Board. Erstelle eines mit „Neues Board für alle“.</div>';
       return;
     }
-    var n=board.size, on=[], i;
+    var n=state.size, on=[], i;
     for(i=0;i<n*n;i++) on.push(isOn(i));
     var winSet={}, bingos=0;
     lines(n).forEach(function(l){
@@ -185,63 +223,40 @@ button:focus-visible,textarea:focus-visible,select:focus-visible,.cell:focus-vis
     var fs = n===3 ? "clamp(.85rem,3.4vw,1.25rem)" : n===4 ? "clamp(.72rem,2.7vw,1.05rem)" : "clamp(.62rem,2.2vw,.92rem)";
     var active=document.activeElement, keep = active && active.dataset ? active.dataset.i : null;
     var html='<div class="board" style="--n:'+n+';--fs:'+fs+'" role="grid">';
-    board.cells.forEach(function(t,i){
-      var free = board.freeIdx===i;
+    for(i=0;i<n*n;i++){
+      var free = state.freeIdx===i;
       var cls="cell"+(on[i]?" on":"")+(free?" free":"")+(winSet[i]?" win":"");
-      html+='<button type="button" class="'+cls+'" data-i="'+i+'" aria-pressed="'+on[i]+'"'+((free||!canMark)?" disabled":"")+'>'+esc(free?"Frei":t)+'</button>';
-    });
+      html+='<button type="button" class="'+cls+'" data-i="'+i+'" aria-pressed="'+on[i]+'"'+(free?" disabled":"")+'>'+esc(free?"Frei":(state.cells[i]||""))+'</button>';
+    }
     wrap.innerHTML=html+"</div>";
     if(keep!==null){ var el=wrap.querySelector('.cell[data-i="'+keep+'"]'); if(el&&!el.disabled) el.focus(); }
   }
 
+  function syncEditor(){
+    if(dirty || !state.pool) return;
+    poolEl.value=state.pool; sizeEl.value=String(state.size); freeEl.checked=!!state.free; updateCount();
+  }
+
   wrap.addEventListener("click",function(e){
-    var b=e.target.closest(".cell"); if(!b||b.disabled||!board||!canMark) return;
-    var i=+b.dataset.i; if(busy[i]) return;
-    busy[i]=1;
-    safe(store.setMark(i,!isOn(i),board.markRev)).then(function(){ busy[i]=0; });
+    var b=e.target.closest(".cell"); if(!b||b.disabled||!state.cells) return;
+    var i=+b.dataset.i;
+    write("/marks/c"+i, isOn(i)?null:true);
   });
   $("gen").addEventListener("click",generate);
-  $("reset").addEventListener("click",function(){ if(board) safe(store.resetMarks(Date.now())); });
+  $("reset").addEventListener("click",function(){ if(state.cells) write("/marks",null); });
+  $("copy").addEventListener("click",function(){
+    try{ navigator.clipboard.writeText(location.href).then(function(){ $("copy").textContent="Kopiert"; setTimeout(function(){ $("copy").textContent="Link kopieren"; },1500); }); }catch(e){}
+  });
+  roomEl.addEventListener("change",function(){
+    var v=roomEl.value.replace(/[^A-Za-z0-9_-]/g,"");
+    if(v) location.hash=v;
+  });
+  window.addEventListener("hashchange",function(){ readRoom(); dirty=false; connect(); });
   poolEl.addEventListener("input",function(){ dirty=true; updateCount(); });
   sizeEl.addEventListener("change",function(){ dirty=true; updateCount(); });
   freeEl.addEventListener("change",function(){ dirty=true; updateCount(); });
 
-  function syncEditor(){
-    if(dirty || !board) return;
-    poolEl.value=board.pool; sizeEl.value=String(board.size); freeEl.checked=!!board.free; updateCount();
-  }
-
-  function localStore(){
-    return {
-      setBoard:function(b){ board=b; marks={}; syncEditor(); render(); return Promise.resolve(); },
-      resetMarks:function(r){ board.markRev=r; render(); return Promise.resolve(); },
-      setMark:function(i,on,rev){ marks["c"+i]={on:on,rev:rev}; render(); return Promise.resolve(); }
-    };
-  }
-
-  async function init(){
-    updateCount(); store=localStore(); render();
-    var db=null, user=null;
-    try{ if(window.claude && claude.use){ db=await claude.use("db"); user=await claude.use("user"); } }catch(e){}
-    if(!db) return;
-    mode="live";
-    try{
-      if(user){
-        canEdit=await user.canEdit();
-        canMark=(await user.can("data.write"))!==false;
-      }
-    }catch(e){}
-    var bref=db.doc("board/main"), mcol=db.collection("marks");
-    store={
-      setBoard:function(b){ return bref.set(b); },
-      resetMarks:function(r){ return bref.update({markRev:r}); },
-      setMark:function(i,on,rev){ return mcol.doc("c"+i).set({on:on,rev:rev}); }
-    };
-    board=null; marks={}; render();
-    bref.onSnapshot(function(s){ board=s.exists?s.data():null; syncEditor(); render(); }, fail);
-    mcol.onSnapshot(function(s){ marks={}; s.docs.forEach(function(d){ marks[d.id]=d.data(); }); render(); }, fail);
-  }
-  init();
+  readRoom(); updateCount(); connect();
 })();
 </script>
 </body>
